@@ -1,0 +1,147 @@
+Here is a Python function that:
+- Takes a list of S3 partitioned paths.
+- Optionally takes a list of 1-based indexes corresponding to partitions to filter on.
+- Extracts partition key-value pairs dynamically.
+- Builds a WHERE clause string for Athena query.
+- Queries Athena table for all columns with the predicates.
+- Returns Athena query results (assumes using boto3 for Athena execution).
+
+The function is case-insensitive for partition keys, handles variable partition depths, and uses all partitions if no indexes are given.
+
+```python
+import re
+import boto3
+import time
+
+def query_athena_with_partitions(
+    s3_paths,
+    athena_database,
+    athena_table,
+    partition_indexes=None,  # list of 1-based indexes; e.g. [3,4,5]
+    region_name='us-east-1',
+    output_location='s3://your-athena-query-results/'
+):
+    """
+    Query Athena table dynamically based on partition predicates extracted from S3 paths.
+
+    Args:
+        s3_paths (list[str]): List of S3 partitioned paths.
+        athena_database (str): Athena database name.
+        athena_table (str): Athena table name.
+        partition_indexes (list[int], optional): 1-based indexes of partitions to use as filters. If None, use all.
+        region_name (str): AWS region.
+        output_location (str): S3 bucket path for Athena query results.
+
+    Returns:
+        List of query result rows as dicts.
+    """
+
+    def extract_partitions_from_path(path):
+        # Extract folder names after bucket prefix: e.g. it_id=39/loan=py_tm/year=2025/month=9/day=7/
+        # Using regex to find all key=value pairs case insensitive
+        # Partition order is maintained as they appear
+        match = re.findall(r"([^/]+=([^/]+))", path.lower())
+        # Returns list of (key=value, value)
+        return match
+
+    # Extract partitions from all paths, flatten into a set of unique predicates by path
+    predicates_list = []
+    for path in s3_paths:
+        parts = extract_partitions_from_path(path)
+        # parts is list of tuples (partition_kv, val)
+        if partition_indexes:
+            # Filter parts by 1-based index
+            selected = [parts[i - 1] for i in partition_indexes if 0 < i <= len(parts)]
+        else:
+            selected = parts
+
+        predicates_list.append(selected)
+
+    # We will combine predicates from all paths to form a WHERE clause that matches ANY of these sets
+    # I.e. ( (k1='v1' and k2='v2') OR (k1='v3' and k2='v4') OR ... )
+    # If predicates_list is empty do a simple SELECT *
+
+    if not predicates_list:
+        query = f"SELECT * FROM {athena_database}.{athena_table} LIMIT 100"
+    else:
+        or_clauses = []
+        for pred in predicates_list:
+            and_parts = []
+            for kv in pred:
+                key_value = kv[0].split('=')
+                if len(key_value) == 2:
+                    key, value = key_value
+                    key = key.strip().lower()
+                    value = value.strip()
+                    # Athena partition values should be quoted as strings for safety
+                    and_parts.append(f"{key} = '{value}'")
+            if and_parts:
+                or_clauses.append(f"({' AND '.join(and_parts)})")
+        where_clause = " OR ".join(or_clauses)
+        query = f"SELECT * FROM {athena_database}.{athena_table} WHERE {where_clause}"
+
+    # Athena client
+    client = boto3.client('athena', region_name=region_name)
+
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': athena_database},
+        ResultConfiguration={'OutputLocation': output_location}
+    )
+    query_execution_id = response['QueryExecutionId']
+
+    # Wait for query to finish
+    while True:
+        result = client.get_query_execution(QueryExecutionId=query_execution_id)
+        state = result['QueryExecution']['Status']['State']
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            break
+        time.sleep(1)
+
+    if state != 'SUCCEEDED':
+        raise Exception(f"Athena query failed or was cancelled: {state}")
+
+    # Get results
+    results_paginator = client.get_paginator('get_query_results')
+    query_results = []
+    for page in results_paginator.paginate(QueryExecutionId=query_execution_id):
+        rows = page['ResultSet']['Rows']
+        # First row may be column headers, skip for results
+        if not query_results:
+            columns = [col['VarCharValue'] for col in rows[0]['Data']]
+            data_rows = rows[1:]
+        else:
+            data_rows = rows
+        for row in data_rows:
+            values = []
+            for i in range(len(columns)):
+                val = ''
+                if i < len(row['Data']):
+                    val = row['Data'][i].get('VarCharValue', '')
+                values.append(val)
+            row_dict = dict(zip(columns, values))
+            query_results.append(row_dict)
+
+    return query_results
+
+
+# Example usage:
+s3_paths_example = [
+    "s3://stg/mps/it_id=39/loan=py_tm/year=2025/month=9/day=7/",
+    "s3://stg/mps/it_id=bgh/loan=tyop/year=2025/month=9/day=7/"
+]
+partition_indexes_example = [3,4,5]  # 1-based indexes: year, month, day
+
+results = query_athena_with_partitions(
+    s3_paths_example,
+    athena_database='my_database',
+    athena_table='my_table',
+    partition_indexes=partition_indexes_example,
+    region_name='us-east-1',
+    output_location='s3://my-athena-query-results/'
+)
+
+for row in results:
+    print(row)
+```
+
