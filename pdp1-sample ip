@@ -1,0 +1,94 @@
+Here's a simple example demonstrating how to use the Glue notebook script from earlier with real values:
+
+Suppose you have an Athena table named `sales_data` in the Glue database `retail_db` partitioned by `year`, `month`, and `day`, and you want to generate push down predicates and read data with one of them.
+
+***
+
+### Example Input:
+
+```python
+database = 'retail_db'
+table = 'sales_data'
+selected_partition_indexes = [0, 1]  # pushdown only on 'year' and 'month'
+```
+
+***
+
+### Expected Output (Print Statement):
+
+```
+Using 12 push down predicates:
+year='2023' and month='01'
+year='2023' and month='02'
+year='2023' and month='03'
+...
+```
+
+***
+
+### Sample Glue Notebook Code Using This:
+
+```python
+import boto3
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+def get_partition_columns_from_glue(database, table):
+    glue = boto3.client('glue')
+    response = glue.get_table(DatabaseName=database, Name=table)
+    return [col['Name'] for col in response['Table']['PartitionKeys']]
+
+def get_partition_values_from_glue(database, table):
+    glue = boto3.client('glue')
+    paginator = glue.get_paginator('get_partitions')
+
+    partitions = []
+    for page in paginator.paginate(DatabaseName=database, TableName=table):
+        for partition in page['Partitions']:
+            partitions.append(partition['Values'])
+    return partitions
+
+def build_dynamic_pushdown_predicates(all_part_cols, partition_values_groups, selected_indexes=None):
+    if selected_indexes is None:
+        selected_indexes = list(range(len(all_part_cols)))
+    selected_columns = [all_part_cols[i] for i in selected_indexes]
+
+    predicates = []
+    for values in partition_values_groups:
+        selected_values = [values[i] for i in selected_indexes]
+        predicate = ' and '.join(f"{col}='{val}'" for col, val in zip(selected_columns, selected_values))
+        predicates.append(predicate)
+
+    return predicates
+
+# User input
+database = 'retail_db'
+table = 'sales_data'
+selected_partition_indexes = [0, 1]  # e.g. 'year', 'month'
+
+partition_columns = get_partition_columns_from_glue(database, table)
+partition_values = get_partition_values_from_glue(database, table)
+
+predicates = build_dynamic_pushdown_predicates(partition_columns, partition_values, selected_partition_indexes)
+
+print(f"Using {len(predicates)} push down predicates:")
+for p in predicates[:5]:  # print sample
+    print(p)
+
+# Example: read data for first predicate
+if predicates:
+    dyf = glueContext.create_dynamic_frame.from_catalog(
+        database=database,
+        table_name=table,
+        push_down_predicate=predicates[0]
+    )
+    dyf.show(10)
+```
+
+***
+
+This will dynamically fetch the partitions from the table, build predicates on the selected partition columns by index, and then use one predicate to read a filtered DynamicFrame from Glue.
