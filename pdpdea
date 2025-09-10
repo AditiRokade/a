@@ -1,0 +1,205 @@
+Here is the complete code with the fix so that `gen_partition_pushdown_predicate` extracts partition keys preserving their original case exactly as returned by `list_s3_partitions_with_day_filter`. It includes all relevant parts from your supplied code with this adjustment applied:
+
+```python
+import sys
+import re
+import boto3
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+from typing import List, Optional
+from dateutil import relativedelta as rd
+from awsglue.transforms import ApplyMapping
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as dt
+from pyspark.sql.functions import col, to_timestamp, year, month, dayofmonth
+from pyspark.sql.types import TimestampType
+from dstools_baseclasses.glue_task import GlueTask
+from dstools_utilities.loggers.dslogger import Log
+from dstools_baseclasses.utils.dea.errors.standard_errors import raise_no_data
+from dstools_baseclasses.utils.dea.s3.s3_utils import (
+    gen_ymd_s3p,
+    gen_move_objects_dict_from_s3p_list,
+    extract_unique_ymd_partitions,
+    gen_ymd_pdp_from_partitions,
+)
+from dstools_baseclasses.utils.dea.glue_catalog.glue_catalog_utils import glue_table_exists
+
+log = Log.configure()
+
+class GlueJob(GlueTask):
+
+    def list_s3_partitions_with_day_filter(self, prefix, exec_date, period, levels=3):
+        s3 = boto3.client('s3')
+        parsed = urlparse(prefix)
+        bucket = parsed.netloc
+        base_prefix = parsed.path.lstrip('/')
+
+        exec_datetime = datetime.fromisoformat(exec_date)
+        min_date = exec_datetime - timedelta(days=period)
+
+        paginator = s3.get_paginator('list_objects_v2')
+        prefixes_by_level = {0: [base_prefix]}
+
+        # Regex to extract year, month, day with case insensitivity
+        ymd_regex = re.compile(r'.*year=(\d{4})/month=(\d{1,2})/day=(\d{1,2})/', re.IGNORECASE)
+
+        for lvl in range(1, levels + 1):
+            prefixes_by_level[lvl] = []
+            for pfx in prefixes_by_level[lvl - 1]:
+                for page in paginator.paginate(Bucket=bucket, Prefix=pfx, Delimiter='/'):
+                    if 'CommonPrefixes' in page:
+                        for cp in page['CommonPrefixes']:
+                            candidate_prefix = cp['Prefix']
+                            if lvl == levels:
+                                match = ymd_regex.match(candidate_prefix)
+                                if match:
+                                    part_year = int(match.group(1))
+                                    part_month = int(match.group(2))
+                                    part_day = int(match.group(3))
+                                    partition_date = datetime(part_year, part_month, part_day)
+                                    if partition_date >= min_date:
+                                        prefixes_by_level[lvl].append(candidate_prefix)
+                            else:
+                                prefixes_by_level[lvl].append(candidate_prefix)
+            prefixes_by_level[lvl] = list(set(prefixes_by_level[lvl]))
+
+        result = [f's3://{bucket}/{pfx}' for pfx in prefixes_by_level.get(levels, [])]
+        return result
+
+    def gen_partition_pushdown_predicate(self, s3_paths: List[str], partition_indexes: Optional[List[int]] = None, capital_partitions: bool = False) -> str:
+        """
+        Generates a push-down predicate string dynamically from a list of S3 partitioned paths,
+        preserving the original case from the paths.
+        """
+        def extract_partitions(path: str) -> List[str]:
+            # Preserve case exactly as in S3 path, do not lowercase
+            return [p for p in re.findall(r'([^/]+=([^/]+))', path)]
+
+        or_clauses = []
+
+        for path in s3_paths:
+            partitions = extract_partitions(path)
+            # Filter by 1-based indexes if provided
+            if partition_indexes:
+                filtered_partitions = [partitions[i-1] for i in partition_indexes if 0 < i <= len(partitions)]
+            else:
+                filtered_partitions = partitions
+
+            if not filtered_partitions:
+                continue
+
+            and_clauses = []
+            for full_kv, val in filtered_partitions:
+                key, value = full_kv.split('=')
+                key = key.upper() if capital_partitions else key  # preserve or uppercase if flagged
+                and_clauses.append(f"{key} = '{value}'")
+
+            or_clauses.append(f"({' AND '.join(and_clauses)})")
+
+        push_down_predicate = " OR ".join(or_clauses) if or_clauses else ""
+
+        return push_down_predicate
+
+    def setup(self):
+        start_date_plus_one_day_to_include_execution_date = str(
+            datetime.fromisoformat(self.data_period_start_time) + rd.relativedelta(days=1)
+        )
+
+        input_1_s3 = self.config["inputs"]["input_1"]["connection_options"]["paths"]
+        input_1_s3_path_list = gen_ymd_s3p(
+            s3_path_temp=input_1_s3, period=5, exec_date=start_date_plus_one_day_to_include_execution_date
+        )
+
+        if not input_1_s3_path_list:
+            raise Exception("No Records found in prepared raw for the specified period")
+        self.config["inputs"]["input_1"]["connection_options"]["paths"] = input_1_s3_path_list
+        self.config = gen_move_objects_dict_from_s3p_list(self.config, "move_1", input_1_s3_path_list)
+
+        input_2_s3 = self.config["outputs"]["output_1"]["path"]
+        partitions = self.list_s3_partitions_with_day_filter(
+            prefix=input_2_s3,
+            exec_date=start_date_plus_one_day_to_include_execution_date,
+            period=5,
+            levels=4
+        )
+        print("partitions after input_2_s3", partitions)
+        input_2_gc_pdp = self.gen_partition_pushdown_predicate(
+            s3_paths=partitions,
+            partition_indexes=None,
+            capital_partitions=True
+        )
+        print("input_2_gc_pdp", input_2_gc_pdp)
+
+        self.fetch_catalog_table = not input_2_gc_pdp and glue_table_exists(
+            table_name=self.config["inputs"]["input_2"]["table_name"],
+            database_name=self.config["inputs"]["input_2"]["database"]
+        )
+
+        if self.fetch_catalog_table:
+            self.config["inputs"]["input_2"]["other_kwargs"]["push_down_predicate"] = input_2_gc_pdp
+        else:
+            self.config["inputs"].pop("input_2")
+
+        return super().setup()
+
+    def transform(self, extracts):
+        df = extracts['input_1']
+        execution_date_str = self.data_period_start_time
+        execution_date = datetime.strptime(execution_date_str, "%Y-%m-%d %H:%M:%S")
+
+        dyf = df.toDF()
+        if dyf.rdd.isEmpty():
+            raise_no_data(f"No records for the {execution_date} period")
+        dynamic_frame = ApplyMapping.apply(
+            frame=df,
+            mappings=[
+                ("DUP", "string", "DUP", "string"),
+                ("F_FI_ID", "string", "F_FI_ID", "long"),
+                ("MOR_LOAD_DATA_TS", "string", "MOR_LOAD_DATA_TS", "timestamp"),
+                ("MOR_ORDERID", "string", "MOR_ORDERID", "string"),
+                ("MOR_REFERENCE_KEY", "string", "MOR_REFERENCE_KEY", "string"),
+                ("MOR_REFERENCE_VALUE", "string", "MOR_REFERENCE_VALUE", "string"),
+                ("MOR_TRANS_INITATE_TIME", "string", "MOR_TRANS_INITATE_TIME", "timestamp"),
+                ("year", "long", "YEAR", "string"),
+                ("month", "long", "MONTH", "string"),
+                ("day", "long", "DAY", "string"),
+            ],
+            transformation_ctx="dynamic_frame",
+        )
+
+        df = dynamic_frame.toDF().dropDuplicates()
+        spark_df_1 = df
+
+        if self.fetch_catalog_table:
+            dynamic_frame_2 = extracts["input_2"]
+            spark_df_1 = df
+            spark_df_2 = dynamic_frame_2.toDF()
+
+            print("spark_df_1")
+            spark_df_1.show(2)
+            spark_df_1.printSchema()
+
+            print("spark_df_2")
+            spark_df_2.show(2)
+            spark_df_2.printSchema()
+            if not spark_df_2.rdd.isEmpty():
+                df = spark_df_1.subtract(spark_df_2)
+                print("after subtract")
+                df.count()
+            else:
+                df = spark_df_1
+        else:
+            df = spark_df_1
+
+        df = df.dropDuplicates()
+        df = df.where(df.DUP == 'N')
+        print("after the where")
+        df.show(2)
+
+        return {'output_1': df}
+```
+
+This version preserves partition key case in predicates as extracted from the actual S3 paths. It maintains your existing functionality with improved case consistency between partition discovery and predicate generation.
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/4793027/cb642774-0df1-42ed-812c-aeae576f3dce/serr.txt)
