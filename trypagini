@@ -1,0 +1,84 @@
+import boto3
+import re
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
+
+def list_s3_partitions_with_known_date_indexes(s3_path, exec_date, period, year_idx, month_idx, day_idx):
+    s3 = boto3.client('s3')
+
+    # Parse bucket and base prefix
+    parsed = urlparse(s3_path)
+    bucket = parsed.netloc
+    base_prefix = parsed.path.lstrip('/')
+
+    exec_datetime = datetime.fromisoformat(exec_date)
+    min_date = exec_datetime - timedelta(days=period)
+
+    # Regular expression to extract year/month/day from folder name e.g. year=2025, month=9, day=15
+    partition_re = re.compile(r'(\w+)=([0-9]+)', re.IGNORECASE)
+    
+    paginator = s3.get_paginator('list_objects_v2')
+
+    # Initialize prefixes at level 0 with base_prefix parts split by '/'
+    prefixes_by_level = {0: [base_prefix.strip('/')]}  # Store as list of folder name components
+    
+    max_level = max(year_idx, month_idx, day_idx) + 1
+    result_prefixes = []
+
+    for level in range(1, max_level + 1):
+        prefixes_by_level[level] = []
+        
+        for prefix_components in prefixes_by_level[level - 1]:
+            # Build prefix string for S3 call by joining components and adding trailing '/'
+            prefix_str = '/'.join(prefix_components) + '/'
+            
+            # Paginate S3 listing with Delimiter '/' to get immediate subfolders
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix_str, Delimiter='/'):
+                if 'CommonPrefixes' not in page:
+                    continue
+                
+                for cp in page['CommonPrefixes']:
+                    subfolder = cp['Prefix'][len(prefix_str):].rstrip('/')  # Get relative last folder name
+                    # Append this subfolder to the prefix components list for next level
+                    new_prefix_components = prefix_components.split('/') if isinstance(prefix_components, str) else prefix_components[:]
+                    new_prefix_components.append(subfolder)
+                    
+                    # If this level corresponds to any of year_idx, month_idx, day_idx, extract value and filter
+                    # Extract partition key/value pairs from prefix components at this level
+                    parts = {}
+                    for idx, part in enumerate(new_prefix_components):
+                        m = partition_re.match(part)
+                        if m:
+                            parts[m.group(1).lower()] = int(m.group(2))
+                    
+                    # Check filtering only if we have all of year, month, day to form date
+                    if level == day_idx + 1:
+                        if ('year' in parts and 'month' in parts and 'day' in parts):
+                            partition_date = datetime(parts['year'], parts['month'], parts['day'])
+                            if partition_date >= min_date:
+                                prefixes_by_level[level].append('/'.join(new_prefix_components))
+                                # Collect full S3 prefix
+                                result_prefixes.append(f"s3://{bucket}/{'/'.join(new_prefix_components)}/")
+                        # else skip prefix if date parts missing
+                    else:
+                        # For levels before day_idx, just add all prefixes (no filtering)
+                        prefixes_by_level[level].append('/'.join(new_prefix_components))
+    
+    return result_prefixes
+
+
+# Example usage:
+# If year=3rd folder, month=4th folder, day=5th folder (0-based indices 2,3,4)
+# s3://bucket/datapath/otherpart=val/year=2025/month=9/day=15/
+# user calls with year_idx=2, month_idx=3, day_idx=4
+
+result = list_s3_partitions_with_known_date_indexes(
+    s3_path='s3://mybucket/data/otherpart=xyz',
+    exec_date='2025-09-16',
+    period=10,
+    year_idx=2,
+    month_idx=3,
+    day_idx=4,
+)
+
+print(result)
