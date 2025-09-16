@@ -1,0 +1,61 @@
+def list_s3_partitions_with_day_filter(prefix, exec_date, period, levels=3, year_idx=None, month_idx=None, day_idx=None):
+    s3 = boto3.client('s3')
+    parsed = urlparse(prefix)
+    bucket = parsed.netloc
+    base_prefix = parsed.path.lstrip('/')
+    exec_datetime = datetime.fromisoformat(exec_date)
+    min_date = exec_datetime - timedelta(days=period)
+    paginator = s3.get_paginator('list_objects_v2')
+
+    part_re = re.compile(r'(\w+)=([0-9]+)', re.IGNORECASE)
+    prefixes_by_level = {0: [base_prefix.strip('/').split('/')]}
+    max_level = levels
+
+    results = []
+
+    for lvl in range(1, max_level + 1):
+        prefixes_by_level[lvl] = []
+        for prefix_parts in prefixes_by_level[lvl - 1]:
+            prefix_str = '/'.join(prefix_parts) + '/'
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix_str, Delimiter='/'):
+                if 'CommonPrefixes' not in page:
+                    continue
+                for cp in page['CommonPrefixes']:
+                    subfolder = cp['Prefix'][len(prefix_str):].rstrip('/')
+                    new_prefix_parts = prefix_parts[:] + [subfolder]
+
+                    parts_dict = {}
+                    for idx, part in enumerate(new_prefix_parts):
+                        m = part_re.match(part)
+                        if m:
+                            parts_dict[m.group(1).lower()] = int(m.group(2))
+
+                    # Year filtering
+                    if year_idx is not None and lvl == year_idx:
+                        if 'year' in parts_dict and parts_dict['year'] < min_date.year:
+                            continue
+
+                    # Month filtering
+                    if month_idx is not None and lvl == month_idx:
+                        if 'year' in parts_dict and 'month' in parts_dict:
+                            month_date = datetime(parts_dict['year'], parts_dict['month'], 1)
+                            if month_date < min_date - timedelta(days=31):
+                                continue
+
+                    # Day filtering
+                    if day_idx is not None and lvl == day_idx:
+                        if 'year' in parts_dict and 'month' in parts_dict and 'day' in parts_dict:
+                            day_date = datetime(parts_dict['year'], parts_dict['month'], parts_dict['day'])
+                            if day_date < min_date:
+                                continue
+
+                    # If the current level is beyond day_idx, do not paginate further
+                    if day_idx is not None and lvl > day_idx:
+                        continue
+
+                    prefixes_by_level[lvl].append(new_prefix_parts)
+
+                    if day_idx is not None and lvl == day_idx:
+                        results.append(f's3://{bucket}/' + '/'.join(new_prefix_parts) + '/')
+
+    return results
