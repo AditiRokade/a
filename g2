@@ -1,0 +1,74 @@
+import sys
+from awsglue.transforms import ResolveChoice, ApplyMapping
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, when
+from awsglue.dynamicframe import DynamicFrame
+
+# Initialize Spark and Glue contexts, and logger
+sc = SparkContext()
+glueContext = GlueContext(sc)
+logger = glueContext.get_logger()
+job = Job(glueContext)
+
+try:
+    logger.info("Job started")
+
+    s3_input_path = "s3://your-bucket/your-folder/"
+    s3_output_path = "s3://your-bucket/output-folder/"
+
+    logger.info(f"Reading parquet files from {s3_input_path}")
+    input_dynamic_frame = glueContext.create_dynamic_frame.from_options(
+        connection_type="s3",
+        connection_options={"paths": [s3_input_path], "recurse": True},
+        format="parquet"
+    )
+    logger.info(f"Read {input_dynamic_frame.count()} records from source")
+
+    # Convert DynamicFrame to DataFrame for explicit cast
+    df = input_dynamic_frame.toDF()
+    logger.info("Casting 'moa_acc_no' column to string to avoid scientific notation")
+    df = df.withColumn("moa_acc_no", col("moa_acc_no").cast("string"))
+
+    logger.info("Replacing null values in 'moa_acc_no' with string 'null'")
+    df_fixed = df.withColumn(
+        "moa_acc_no",
+        when(col("moa_acc_no").isNull(), "null").otherwise(col("moa_acc_no"))
+    )
+
+    logger.info("Sample values after null fix:")
+    df_fixed.select("moa_acc_no").show(10, truncate=False)
+
+    logger.info("Converting back to DynamicFrame after cast and null fix")
+    dynamic_frame_fixed = DynamicFrame.fromDF(df_fixed, glueContext, "dynamic_frame_fixed")
+
+    logger.info("Applying ResolveChoice to make sure 'moa_acc_no' is string")
+    resolved_dynamic_frame = ResolveChoice.apply(
+        frame=dynamic_frame_fixed,
+        specs=[("moa_acc_no", "cast:string")]
+    )
+
+    logger.info("Applying ApplyMapping to enforce output schema")
+    mapped_dynamic_frame = ApplyMapping.apply(
+        frame=resolved_dynamic_frame,
+        mappings=[
+            ("moa_acc_no", "string", "moa_acc_no", "string"),
+            # Add other columns mappings here as needed
+        ]
+    )
+
+    logger.info(f"Writing cleaned output to {s3_output_path}")
+    glueContext.write_dynamic_frame.from_options(
+        frame=mapped_dynamic_frame,
+        connection_type="s3",
+        connection_options={"path": s3_output_path},
+        format="parquet"
+    )
+
+    logger.info("Job completed successfully")
+    job.commit()
+
+except Exception as e:
+    logger.error(f"Job failed with error: {str(e)}")
+    raise
