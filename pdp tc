@@ -1,0 +1,41 @@
+import pytest
+from dstools_baseclasses.utils.dea.s3.s3_utils import gen_partition_pushdown_pred
+
+def test_gen_partition_pushdown_pred_basic():
+    s3_paths = [
+        "s3://bucket/year=2024/month=12/day=25/",
+        "s3://bucket/year=2023/month=10/day=20/file.csv"
+    ]
+    result = gen_partition_pushdown_pred(s3_paths)
+    assert "(year = '2024' AND month = '12' AND day = '25')" in result
+    assert "(year = '2023' AND month = '10' AND day = '20')" in result
+
+def test_gen_partition_pushdown_pred_with_capital_partitions():
+    s3_paths = [
+        "s3://bucket/year=2024/month=12/day=25/",
+        "s3://bucket/year=2023/month=10/day=20/file.csv"
+    ]
+    result = gen_partition_pushdown_pred(s3_paths, capital_partitions=True)
+    assert "(YEAR = '2024' AND MONTH = '12' AND DAY = '25')" in result
+    assert "(YEAR = '2023' AND MONTH = '10' AND DAY = '20')" in result
+
+def test_gen_partition_pushdown_pred_with_partition_indexes():
+    s3_paths = [
+        "s3://bucket/year=2024/month=12/day=25/",
+        "s3://bucket/year=2023/month=10/day=20/file.csv"
+    ]
+    # Only filter on first partition index (year)
+    result = gen_partition_pushdown_pred(s3_paths, partition_indexes=[1])
+    assert "(year = '2024')" in result
+    assert "(year = '2023')" in result
+    assert "month" not in result
+
+def test_gen_partition_pushdown_pred_empty_list():
+    result = gen_partition_pushdown_pred([])
+    assert result == ""
+
+def test_gen_partition_pushdown_pred_invalid_partition_format():
+    s3_paths = ["s3://bucket/no_partitions/"]
+    result = gen_partition_pushdown_pred(s3_paths)
+    # Result should be empty because no partitions to extract
+    assert result == ""
