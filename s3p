@@ -1,0 +1,35 @@
+import pytest
+from unittest.mock import MagicMock, patch
+from dstools_baseclasses.utils.dea.s3.s3_utils import gen_multi_level_partition_list
+
+def mocked_paginate_event_source(Bucket, Prefix, Delimiter):
+    # Simulate nested 5-level partition structure
+    if Prefix == "path/":
+        return [{"CommonPrefixes": [{"Prefix": "path/event=login/"}]}]
+    if Prefix == "path/event=login/":
+        return [{"CommonPrefixes": [{"Prefix": "path/event=login/source=web/"}]}]
+    if Prefix == "path/event=login/source=web/":
+        return [{"CommonPrefixes": [{"Prefix": "path/event=login/source=web/year=2024/"}]}]
+    if Prefix == "path/event=login/source=web/year=2024/":
+        return [{"CommonPrefixes": [{"Prefix": "path/event=login/source=web/year=2024/month=12/"}]}]
+    if Prefix == "path/event=login/source=web/year=2024/month=12/":
+        return [{"CommonPrefixes": [{"Prefix": "path/event=login/source=web/year=2024/month=12/day=25/"}]}]
+    return [{"CommonPrefixes": []}]
+
+@patch("boto3.client")
+def test_gen_multi_level_partition_list_event_source_partition(mock_boto_client):
+    paginator_mock = MagicMock()
+    paginator_mock.paginate.side_effect = mocked_paginate_event_source
+    s3_mock = MagicMock()
+    s3_mock.get_paginator.return_value = paginator_mock
+    mock_boto_client.return_value = s3_mock
+
+    prefix = "s3://dummy-bucket/path/"
+    exec_date = "2024-12-31T00:00:00"
+    period = 100
+
+    result = gen_multi_level_partition_list(prefix, exec_date, period, levels=5, year_idx=4, month_idx=5, day_idx=6)
+
+    expected = ["s3://dummy-bucket/path/event=login/source=web/year=2024/month=12/day=25/"]
+
+    assert result == expected
