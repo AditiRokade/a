@@ -26,7 +26,8 @@ for path in files:
     except Exception as e:
         schemas[path] = f"ERROR: {str(e)}"
 
-# Print only files with column type discrepancies
 for path, dtype in schemas.items():
     if dtype != "string":
-        print
+        print(f"{path}: {col_to_check} type = {dtype}")
+
+print("Unique data types across files:", set(schemas.values()))
