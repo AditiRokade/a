@@ -1,0 +1,71 @@
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from awsglue.transforms import ResolveChoice, ApplyMapping
+from pyspark.sql.functions import col, when
+
+# Initialize Glue and Spark contexts
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+logger = glueContext.get_logger()
+
+try:
+    logger.info("Job started")
+
+    s3_input_path = "s3://your-bucket/your-folder/"
+    s3_output_path = "s3://your-bucket/output-folder/"
+
+    logger.info(f"Reading parquet files from {s3_input_path}")
+    input_dynamic_frame = glueContext.create_dynamic_frame.from_options(
+        connection_type="s3",
+        connection_options={"paths": [s3_input_path], "recurse": True},
+        format="parquet"
+    )
+    logger.info(f"Read {input_dynamic_frame.count()} records from source")
+
+    logger.info("Applying ResolveChoice to cast 'moa_acc_no' as string")
+    resolved_dynamic_frame = ResolveChoice.apply(
+        frame=input_dynamic_frame,
+        specs=[("moa_acc_no", "cast:string")]
+    )
+    logger.info("ResolveChoice applied")
+
+    logger.info("Converting to DataFrame for null handling")
+    df = resolved_dynamic_frame.toDF()
+
+    logger.info("Replacing null values with 'null' string in 'moa_acc_no'")
+    df_fixed = df.withColumn(
+        "moa_acc_no",
+        when(col("moa_acc_no").isNull(), "null").otherwise(col("moa_acc_no"))
+    )
+
+    logger.info("Sample values after null fix:")
+    df_fixed.select("moa_acc_no").show(10, truncate=False)
+
+    logger.info("Converting back to DynamicFrame")
+    final_dynamic_frame = glueContext.create_dynamic_frame.from_df(df_fixed, glueContext, "final_dynamic_frame")
+
+    logger.info("Applying ApplyMapping to enforce schema")
+    mapped_dynamic_frame = ApplyMapping.apply(
+        frame=final_dynamic_frame,
+        mappings=[
+            ("moa_acc_no", "string", "moa_acc_no", "string"),
+            # Add other columns and mappings here
+        ]
+    )
+    logger.info("ApplyMapping applied")
+
+    logger.info(f"Writing output to {s3_output_path}")
+    glueContext.write_dynamic_frame.from_options(
+        frame=mapped_dynamic_frame,
+        connection_type="s3",
+        connection_options={"path": s3_output_path},
+        format="parquet"
+    )
+    logger.info("Write completed")
+
+    logger.info("Job completed successfully")
+
+except Exception as e:
+    logger.error(f"Job failed with error: {str(e)}")
+    raise
