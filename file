@@ -1,33 +1,5 @@
-import boto3
-from pyspark.sql import SparkSession
+from pyspark.sql.functions import format_number, col
 
-bucket = "your-bucket"
-prefix = "folder/year=2025/"
-col_to_check = "moa_acc_no"
-
-# List all parquet files recursively under the prefix
-s3 = boto3.client('s3')
-paginator = s3.get_paginator('list_objects_v2')
-files = []
-for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-    for obj in page.get('Contents', []):
-        if obj['Key'].endswith('.parquet'):
-            files.append(f"s3://{bucket}/{obj['Key']}")
-
-schemas = {}
-spark = SparkSession.builder.getOrCreate()
-
-for path in files:
-    try:
-        df = spark.read.parquet(path)
-        dtypes = dict(df.dtypes)
-        dtype = dtypes.get(col_to_check, "NOT_FOUND")
-        schemas[path] = dtype
-    except Exception as e:
-        schemas[path] = f"ERROR: {str(e)}"
-
-for path, dtype in schemas.items():
-    if dtype != "string":
-        print(f"{path}: {col_to_check} type = {dtype}")
-
-print("Unique data types across files:", set(schemas.values()))
+# Example: avoid scientific notation by formatting decimal with fixed number of decimals
+df = df.withColumn("moa_acc_no_dec", col("moa_acc_no").cast("decimal(38,0)"))
+df.select(format_number("moa_acc_no_dec", 0).alias("moa_acc_no_formatted")).show(truncate=False)
